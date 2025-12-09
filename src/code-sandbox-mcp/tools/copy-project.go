@@ -42,9 +42,12 @@ func CopyProject(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToo
 
 	// Get the destination path (optional parameter)
 	destDir, ok := request.Params.Arguments["dest_dir"].(string)
-	if !ok || destDir == "" {
-		// Default: use the name of the source directory
-		destDir = filepath.Join("/app", filepath.Base(localSrcDir))
+	copyToHomeDir := false
+
+	if !ok || destDir == "" || destDir == "." {
+		// Default: copy contents directly to /app directory in the container
+		destDir = "/app"
+		copyToHomeDir = true
 	} else {
 		// If provided but doesn't start with /, prepend /app/
 		if !strings.HasPrefix(destDir, "/") {
@@ -53,15 +56,22 @@ func CopyProject(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToo
 	}
 
 	// Create tar archive of the source directory
-	tarBuffer, err := createTarArchive(localSrcDir)
+	tarBuffer, err := createTarArchive(localSrcDir, copyToHomeDir)
 	if err != nil {
 		return mcp.NewToolResultText(fmt.Sprintf("Error creating tar archive: %v", err)), nil
 	}
 
 	// CopyToContainer directly extracts the tar to the destination
-	// We need to copy to the parent of destDir and let it create the final directory
-	parentDir := filepath.Dir(destDir)
-	err = copyToContainer(ctx, containerID, parentDir, tarBuffer)
+	var targetPath string
+	if copyToHomeDir {
+		// Copy contents directly to destDir (home directory)
+		targetPath = destDir
+	} else {
+		// We need to copy to the parent of destDir and let it create the final directory
+		targetPath = filepath.Dir(destDir)
+	}
+
+	err = copyToContainer(ctx, containerID, targetPath, tarBuffer)
 	if err != nil {
 		return mcp.NewToolResultText(fmt.Sprintf("Error copying to container: %v", err)), nil
 	}
@@ -69,8 +79,55 @@ func CopyProject(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToo
 	return mcp.NewToolResultText(fmt.Sprintf("Successfully copied %s to %s in container %s", localSrcDir, destDir, containerID)), nil
 }
 
+// getContainerHomeDir gets the home directory of the user running in the container
+func getContainerHomeDir(ctx context.Context, cli *client.Client, containerID string) (string, error) {
+	// Create the exec configuration to get the home directory
+	exec, err := cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
+		Cmd:          []string{"sh", "-c", "echo $HOME"},
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create exec: %w", err)
+	}
+
+	// Attach to capture stdout/stderr
+	attach, err := cli.ContainerExecAttach(ctx, exec.ID, container.ExecStartOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to attach to exec: %w", err)
+	}
+	defer attach.Close()
+
+	// Read the output
+	var stdout bytes.Buffer
+	io.Copy(&stdout, attach.Reader)
+
+	// Wait for the command to complete
+	for {
+		inspect, err := cli.ContainerExecInspect(ctx, exec.ID)
+		if err != nil {
+			return "", fmt.Errorf("failed to inspect exec: %w", err)
+		}
+		if !inspect.Running {
+			if inspect.ExitCode != 0 {
+				return "", fmt.Errorf("command exited with code %d", inspect.ExitCode)
+			}
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	homeDir := strings.TrimSpace(stdout.String())
+	if homeDir == "" {
+		// Fallback to /root if HOME is not set
+		homeDir = "/root"
+	}
+
+	return homeDir, nil
+}
+
 // createTarArchive creates a tar archive of the specified source path
-func createTarArchive(srcPath string) (io.Reader, error) {
+func createTarArchive(srcPath string, copyContentsOnly bool) (io.Reader, error) {
 	buf := new(bytes.Buffer)
 	tw := tar.NewWriter(buf)
 	defer tw.Close()
@@ -100,7 +157,12 @@ func createTarArchive(srcPath string) (io.Reader, error) {
 			return nil
 		}
 
-		header.Name = filepath.Join(baseDir, relPath)
+		// If copyContentsOnly is true, don't include the base directory name
+		if copyContentsOnly {
+			header.Name = relPath
+		} else {
+			header.Name = filepath.Join(baseDir, relPath)
+		}
 
 		if err := tw.WriteHeader(header); err != nil {
 			return err
@@ -145,13 +207,8 @@ func copyToContainer(ctx context.Context, containerID string, destPath string, t
 		return fmt.Errorf("failed to inspect container: %w", err)
 	}
 
-	// Ensure the destination directory exists in the container
-	createDirCmd := []string{"mkdir", "-p", destPath}
-	if err := executeCommand(ctx, containerID, createDirCmd); err != nil {
-		return fmt.Errorf("failed to create destination directory: %w", err)
-	}
-
 	// Copy the tar archive to the container - this automatically extracts it
+	// Docker's CopyToContainer will create parent directories if needed
 	err = cli.CopyToContainer(ctx, containerID, destPath, tarArchive, container.CopyToContainerOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to copy to container: %w", err)
