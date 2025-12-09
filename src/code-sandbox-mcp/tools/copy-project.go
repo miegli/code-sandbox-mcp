@@ -58,26 +58,12 @@ func CopyProject(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToo
 		return mcp.NewToolResultText(fmt.Sprintf("Error creating tar archive: %v", err)), nil
 	}
 
-	// Create a temporary file name for the tar archive in the container
-	tarFileName := filepath.Join("/tmp", fmt.Sprintf("project_%s.tar", filepath.Base(localSrcDir)))
-
-	// Copy the tar archive to the container's temp directory
-	err = copyToContainer(ctx, containerID, "/tmp", tarBuffer)
+	// CopyToContainer directly extracts the tar to the destination
+	// We need to copy to the parent of destDir and let it create the final directory
+	parentDir := filepath.Dir(destDir)
+	err = copyToContainer(ctx, containerID, parentDir, tarBuffer)
 	if err != nil {
 		return mcp.NewToolResultText(fmt.Sprintf("Error copying to container: %v", err)), nil
-	}
-
-	// Extract the tar archive in the container
-	err = extractTarInContainer(ctx, containerID, tarFileName, destDir)
-	if err != nil {
-		return mcp.NewToolResultText(fmt.Sprintf("Error extracting archive in container: %v", err)), nil
-	}
-
-	// Clean up the temporary tar file
-	cleanupCmd := []string{"rm", tarFileName}
-	if err := executeCommand(ctx, containerID, cleanupCmd); err != nil {
-		// Just log the error but don't fail the operation
-		fmt.Printf("Warning: Failed to clean up temporary tar file: %v\n", err)
 	}
 
 	return mcp.NewToolResultText(fmt.Sprintf("Successfully copied %s to %s in container %s", localSrcDir, destDir, containerID)), nil
@@ -159,33 +145,16 @@ func copyToContainer(ctx context.Context, containerID string, destPath string, t
 		return fmt.Errorf("failed to inspect container: %w", err)
 	}
 
-	// Create the destination directory in the container if it doesn't exist
+	// Ensure the destination directory exists in the container
 	createDirCmd := []string{"mkdir", "-p", destPath}
 	if err := executeCommand(ctx, containerID, createDirCmd); err != nil {
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
-	// Copy the tar archive to the container
+	// Copy the tar archive to the container - this automatically extracts it
 	err = cli.CopyToContainer(ctx, containerID, destPath, tarArchive, container.CopyToContainerOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to copy to container: %w", err)
-	}
-
-	return nil
-}
-
-// extractTarInContainer extracts a tar archive inside the container
-func extractTarInContainer(ctx context.Context, containerID string, tarFilePath string, destPath string) error {
-	// Create the destination directory if it doesn't exist
-	mkdirCmd := []string{"mkdir", "-p", destPath}
-	if err := executeCommand(ctx, containerID, mkdirCmd); err != nil {
-		return fmt.Errorf("failed to create destination directory: %w", err)
-	}
-
-	// Extract the tar archive
-	extractCmd := []string{"tar", "-xf", tarFilePath, "-C", destPath}
-	if err := executeCommand(ctx, containerID, extractCmd); err != nil {
-		return fmt.Errorf("failed to extract tar archive: %w", err)
 	}
 
 	return nil
@@ -212,10 +181,18 @@ func executeCommand(ctx context.Context, containerID string, cmd []string) error
 		return fmt.Errorf("failed to create exec: %w", err)
 	}
 
-	// Start the exec command
-	if err := cli.ContainerExecStart(ctx, exec.ID, container.ExecStartOptions{}); err != nil {
-		return fmt.Errorf("failed to start exec: %w", err)
+	// Attach to capture stdout/stderr
+	attach, err := cli.ContainerExecAttach(ctx, exec.ID, container.ExecStartOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to attach to exec: %w", err)
 	}
+	defer attach.Close()
+
+	// Read output in background
+	var stdout, stderr bytes.Buffer
+	go func() {
+		io.Copy(&stdout, attach.Reader)
+	}()
 
 	// Wait for the command to complete
 	for {
@@ -225,7 +202,11 @@ func executeCommand(ctx context.Context, containerID string, cmd []string) error
 		}
 		if !inspect.Running {
 			if inspect.ExitCode != 0 {
-				return fmt.Errorf("command exited with code %d", inspect.ExitCode)
+				errMsg := stderr.String()
+				if errMsg == "" {
+					errMsg = stdout.String()
+				}
+				return fmt.Errorf("command exited with code %d: %s", inspect.ExitCode, errMsg)
 			}
 			break
 		}
