@@ -31,23 +31,31 @@ func WriteFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolR
 		return mcp.NewToolResultText("file_contents is required"), nil
 	}
 
-	// Get the destination path (optional parameter)
-	destDir, ok := request.Params.Arguments["dest_dir"].(string)
-	if !ok || destDir == "" {
-		// Default: write to the working directory
-		destDir = "/app"
+	// Determine the full path
+	var fullPath string
+	if strings.HasPrefix(fileName, "/") {
+		// fileName is already an absolute path, use it as-is
+		fullPath = fileName
 	} else {
-		// If provided but doesn't start with /, prepend /app/
-		if !strings.HasPrefix(destDir, "/") {
-			destDir = filepath.Join("/app", destDir)
+		// fileName is relative, resolve it against destDir
+		destDir, ok := request.Params.Arguments["dest_dir"].(string)
+		if !ok || destDir == "" {
+			// Default: write to the working directory
+			destDir = "/app"
+		} else {
+			// If provided but doesn't start with /, prepend /app/
+			if !strings.HasPrefix(destDir, "/") {
+				destDir = filepath.Join("/app", destDir)
+			}
 		}
+		fullPath = filepath.Join(destDir, fileName)
 	}
 
-	// Full path to the file
-	fullPath := filepath.Join(destDir, fileName)
+	// Extract directory from full path
+	dirPath := filepath.Dir(fullPath)
 
 	// Create the directory if it doesn't exist
-	if err := ensureDirectoryExists(ctx, containerID, destDir); err != nil {
+	if err := ensureDirectoryExists(ctx, containerID, dirPath); err != nil {
 		return mcp.NewToolResultText(fmt.Sprintf("Error creating directory: %v", err)), nil
 	}
 
